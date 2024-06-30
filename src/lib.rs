@@ -15,13 +15,13 @@ cfg_if! {
         pub use log;
     } else {
         #[allow(unused_macros)]
-        mod log {
+        pub mod log {
             macro_rules! trace (($($tt:tt)*) => {{}});
             macro_rules! debug (($($tt:tt)*) => {{}});
             macro_rules! info (($($tt:tt)*) => {{}});
             macro_rules! warn (($($tt:tt)*) => {{}});
             macro_rules! error (($($tt:tt)*) => {{}});
-            pub(crate) use {debug, trace};
+            pub(crate) use {debug, trace, info, error};
         }
     }
 }
@@ -29,6 +29,9 @@ cfg_if! {
 use crate::log::*;
 
 mod error;
+#[cfg(target_os = "windows")]
+mod windows_utils;
+
 pub use error::*;
 
 //Load up the proper OS implementation
@@ -54,6 +57,7 @@ pub struct ShmemConf {
     size: usize,
     ext: os_impl::ShmemConfExt,
 }
+
 impl Drop for ShmemConf {
     fn drop(&mut self) {
         // Delete the flink if we are the owner of the mapping
@@ -101,14 +105,14 @@ impl ShmemConf {
     }
 
     /// Create a new mapping using the current configuration
-    pub fn create(mut self) -> Result<Shmem, ShmemError> {
+    pub fn create(mut self) -> Result<Shmem, Error> {
         if self.size == 0 {
-            return Err(ShmemError::MapSizeZero);
+            return Err(Error::MapSizeZero);
         }
 
         if let Some(ref flink_path) = self.flink_path {
             if !self.overwrite_flink && flink_path.is_file() {
-                return Err(ShmemError::LinkExists);
+                return Err(Error::LinkExists);
             }
         }
 
@@ -119,7 +123,7 @@ impl ShmemConf {
                 loop {
                     let cur_id = format!("/shmem_{:X}", rand::random::<u64>());
                     match os_impl::create_mapping(&cur_id, self.size) {
-                        Err(ShmemError::MappingIdExists) => continue,
+                        Err(Error::MappingIdExists) => continue,
                         Ok(m) => break m,
                         Err(e) => {
                             return Err(e);
@@ -129,7 +133,7 @@ impl ShmemConf {
             }
             Some(ref specific_id) => os_impl::create_mapping(specific_id, self.size)?,
         };
-        debug!("Created shared memory mapping '{}'", mapping.unique_id);
+        debug!("Created shared memory mapping '{}'", mapping.name());
 
         // Create flink
         if let Some(ref flink_path) = self.flink_path {
@@ -146,26 +150,26 @@ impl ShmemConf {
             match open_options.open(flink_path) {
                 Ok(mut f) => {
                     // write the shmem uid asap
-                    if let Err(e) = f.write(mapping.unique_id.as_bytes()) {
+                    if let Err(e) = f.write(mapping.name().as_bytes()) {
                         let _ = std::fs::remove_file(flink_path);
-                        return Err(ShmemError::LinkWriteFailed(e));
+                        return Err(Error::LinkWriteFailed(e));
                     }
                 }
                 Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                    return Err(ShmemError::LinkExists)
+                    return Err(Error::LinkExists);
                 }
-                Err(e) => return Err(ShmemError::LinkCreateFailed(e)),
+                Err(e) => return Err(Error::LinkCreateFailed(e)),
             }
 
             debug!(
                 "Created file link '{}' with id '{}'",
                 flink_path.to_string_lossy(),
-                mapping.unique_id
+                mapping.name()
             );
         }
 
         self.owner = true;
-        self.size = mapping.map_size;
+        self.size = mapping.map_size();
 
         Ok(Shmem {
             config: self,
@@ -174,11 +178,11 @@ impl ShmemConf {
     }
 
     /// Opens an existing mapping using the current configuration
-    pub fn open(mut self) -> Result<Shmem, ShmemError> {
+    pub fn open(mut self) -> Result<Shmem, Error> {
         // Must at least have a flink or an os_id
         if self.flink_path.is_none() && self.os_id.is_none() {
             debug!("Open called with no file link or unique id...");
-            return Err(ShmemError::NoLinkOrOsId);
+            return Err(Error::NoLinkOrOsId);
         }
 
         let mut flink_uid = String::new();
@@ -195,18 +199,18 @@ impl ShmemConf {
                 );
                 let mut f = match File::open(flink_path) {
                     Ok(f) => f,
-                    Err(e) => return Err(ShmemError::LinkOpenFailed(e)),
+                    Err(e) => return Err(Error::LinkOpenFailed(e)),
                 };
                 flink_uid.clear();
                 if let Err(e) = f.read_to_string(&mut flink_uid) {
-                    return Err(ShmemError::LinkReadFailed(e));
+                    return Err(Error::LinkReadFailed(e));
                 }
                 flink_uid.as_str()
             };
 
             match os_impl::open_mapping(unique_id, self.size, &self.ext) {
                 Ok(m) => {
-                    self.size = m.map_size;
+                    self.size = m.map_size();
                     self.owner = false;
 
                     return Ok(Shmem {
@@ -216,7 +220,7 @@ impl ShmemConf {
                 }
                 // If we got this failing os_id from the flink, try again in case the shmem owner didnt write the full
                 // unique_id to the file
-                Err(ShmemError::MapOpenFailed(_)) if self.os_id.is_none() && retry < 5 => {
+                Err(Error::MapOpenFailed(_)) if self.os_id.is_none() && retry < 5 => {
                     retry += 1;
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
@@ -231,6 +235,7 @@ pub struct Shmem {
     config: ShmemConf,
     mapping: os_impl::MapData,
 }
+
 #[allow(clippy::len_without_is_empty)]
 impl Shmem {
     /// Returns whether we created the mapping or not
@@ -249,7 +254,7 @@ impl Shmem {
     }
     /// Returns the OS unique identifier for the mapping
     pub fn get_os_id(&self) -> &str {
-        self.mapping.unique_id.as_str()
+        self.mapping.name()
     }
     /// Returns the flink path if present
     pub fn get_flink_path(&self) -> Option<&PathBuf> {
@@ -257,7 +262,7 @@ impl Shmem {
     }
     /// Returns the total size of the mapping
     pub fn len(&self) -> usize {
-        self.mapping.map_size
+        self.mapping.map_size()
     }
     /// Returns a raw pointer to the mapping
     pub fn as_ptr(&self) -> *mut u8 {

@@ -46,7 +46,7 @@ fn increment_value(shmem_flink: &str, thread_num: usize) {
     // Create or open the shared memory mapping
     let shmem = match ShmemConf::new().size(4096).flink(shmem_flink).create() {
         Ok(m) => m,
-        Err(ShmemError::LinkExists) => ShmemConf::new().flink(shmem_flink).open().unwrap(),
+        Err(Error::LinkExists) => ShmemConf::new().flink(shmem_flink).open().unwrap(),
         Err(e) => {
             eprintln!("Unable to create or open shmem flink {shmem_flink} : {e}");
             return;

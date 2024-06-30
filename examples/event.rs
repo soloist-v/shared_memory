@@ -7,7 +7,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Getting the shared memory mapping");
     let shmem = match ShmemConf::new().size(4096).flink("event_mapping").create() {
         Ok(m) => m,
-        Err(ShmemError::LinkExists) => ShmemConf::new().flink("event_mapping").open()?,
+        Err(Error::LinkExists) => ShmemConf::new().flink("event_mapping").open()?,
         Err(e) => return Err(Box::new(e)),
     };
 
